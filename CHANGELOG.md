@@ -1,8 +1,8 @@
 # Changelog
 
-## v0.1.0 — 2026-10-27
+## v1.0.0 — 2026-10-27
 
-- Initial release.
+- First public release.
 - Hidden `tmux` voice helper with local whisper.cpp transcription.
 - Localhost bridge that types transcripts into the OpenCode prompt and submits them.
 - OpenCode TUI plugin: live footer state, mic meter, `/voice`, and `Ctrl+Alt+V`.
