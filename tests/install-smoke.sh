@@ -7,6 +7,9 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/opencode-voice-install.XXXXXX")
 FAKEBIN="$TMP/fakebin"
 HOME_DIR="$TMP/home"
 BIN_DIR="$HOME_DIR/.local/bin"
+export XDG_CONFIG_HOME="$HOME_DIR/.config"
+export XDG_DATA_HOME="$HOME_DIR/.local/share"
+export XDG_STATE_HOME="$HOME_DIR/.local/state"
 
 cleanup() {
   rm -rf "$TMP"
