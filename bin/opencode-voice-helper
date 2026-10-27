@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# Manage the local OpenCode voice helper.
+#
+# The helper normally runs in a detached tmux session so there is no extra
+# terminal window: hold Right Alt in OpenCode, speak, release, and the
+# transcript is typed into the active OpenCode prompt by the bridge.
+#
+# Commands:
+#   ensure          Start hidden if no voice helper is running
+#   ensure-hidden   Start hidden, replacing a visible helper if necessary
+#   start           Same as ensure-hidden
+#   stop            Stop the helper
+#   restart         Stop, then start hidden
+#   toggle          Stop if running, otherwise start hidden
+#   status          Print state; exit 0 when running, 1 when stopped
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SESSION="${OPENCODE_VOICE_SESSION:-opencode-voice}"
+VOICE_BIN="${OPENCODE_VOICE_BIN:-$(command -v opencode-voice 2>/dev/null || true)}"
+[ -n "$VOICE_BIN" ] || VOICE_BIN="$HOME/.cargo/bin/opencode-voice"
+OCVOICE="${OPENCODE_VOICE_WRAPPER:-$SCRIPT_DIR/ocvoice}"
+if [ ! -x "$OCVOICE" ]; then
+  OCVOICE=$(command -v ocvoice 2>/dev/null || true)
+fi
+PATTERN='opencode-voice --no-handle-prompts'
+
+voice_pids() {
+  local pid args
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    args=$(ps -o args= -p "$pid" 2>/dev/null || true)
+    case "$args" in
+      "$VOICE_BIN --no-handle-prompts"*|*"/opencode-voice --no-handle-prompts"*)
+        printf '%s\n' "$pid"
+        ;;
+    esac
+  done < <(pgrep -u "$UID" -f -- "$PATTERN" 2>/dev/null || true)
+}
+
+voice_running() {
+  [ -n "$(voice_pids)" ]
+}
+
+session_running() {
+  command -v tmux >/dev/null 2>&1 && tmux has-session -t "$SESSION" 2>/dev/null
+}
+
+stop_voice() {
+  local pids pid
+  pids=$(voice_pids)
+  if [ -n "$pids" ]; then
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      voice_running || break
+      sleep 0.2
+    done
+    pids=$(voice_pids)
+    if [ -n "$pids" ]; then
+      # shellcheck disable=SC2086
+      kill -KILL $pids 2>/dev/null || true
+    fi
+  fi
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+}
+
+start_hidden() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "error: tmux is required to run voice input in the background" >&2
+    return 1
+  fi
+  if session_running && voice_running; then
+    echo "Voice is already running (hidden)."
+    return 0
+  fi
+  # The session may still be loading the whisper model, or it may be stale
+  # after a crash.  Wait briefly for a second startup to finish rather than
+  # killing the session out from under it.
+  if session_running; then
+    for _ in $(seq 1 25); do
+      if voice_running; then
+        echo "Voice is already running (hidden)."
+        return 0
+      fi
+      session_running || break
+      sleep 0.2
+    done
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+  fi
+  if [ ! -x "$OCVOICE" ]; then
+    echo "error: voice wrapper not found at $OCVOICE" >&2
+    return 1
+  fi
+
+  tmux new-session -d -s "$SESSION" -x 120 -y 40 "$OCVOICE"
+
+  for _ in $(seq 1 60); do
+    if voice_running; then
+      # Give whisper a moment to load the model before the first hotkey.
+      sleep 2
+      echo "Voice started in the background (hold Right Alt to dictate)."
+      return 0
+    fi
+    if ! session_running; then
+      break
+    fi
+    sleep 0.2
+  done
+
+  echo "error: voice helper failed to start" >&2
+  tmux capture-pane -p -t "$SESSION" 2>/dev/null | tail -n 20 >&2 || true
+  tmux kill-session -t "$SESSION" 2>/dev/null || true
+  return 1
+}
+
+ensure_voice() {
+  local migrate="${1:-false}"
+  if session_running && voice_running; then
+    echo "Voice is already running (hidden)."
+    return 0
+  fi
+  if voice_running; then
+    if [ "$migrate" = "true" ]; then
+      stop_voice
+    else
+      echo "Voice is already running."
+      return 0
+    fi
+  fi
+  start_hidden
+}
+
+status_voice() {
+  if voice_running; then
+    if session_running; then
+      echo "running (hidden)"
+    else
+      echo "running (visible)"
+    fi
+    return 0
+  fi
+  echo "stopped"
+  return 1
+}
+
+case "${1:-status}" in
+  ensure)
+    ensure_voice false
+    ;;
+  ensure-hidden|start)
+    ensure_voice true
+    ;;
+  stop)
+    stop_voice
+    echo "Voice stopped."
+    ;;
+  restart)
+    stop_voice
+    start_hidden
+    ;;
+  toggle)
+    if voice_running; then
+      stop_voice
+      echo "Voice stopped."
+    else
+      start_hidden
+    fi
+    ;;
+  status)
+    status_voice
+    ;;
+  attach)
+    if ! session_running; then
+      echo "Voice is not running." >&2
+      exit 1
+    fi
+    exec tmux attach-session -t "$SESSION"
+    ;;
+  *)
+    echo "Usage: $(basename "$0") {ensure|ensure-hidden|start|stop|restart|toggle|status|attach}" >&2
+    exit 2
+    ;;
+esac

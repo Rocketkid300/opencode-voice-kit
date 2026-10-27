@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Voice Input (dictation only)
+Comment=Hold Right Alt to dictate into the focused OpenCode prompt
+Exec=@BIN_DIR@/ocvoice
+Icon=audio-input-microphone
+Terminal=true
+Categories=Utility;
+Keywords=voice;dictation;whisper;speech;stt;microphone;
+StartupNotify=false

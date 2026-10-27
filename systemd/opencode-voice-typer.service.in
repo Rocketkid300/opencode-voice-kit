@@ -1,0 +1,14 @@
+[Unit]
+Description=opencode-voice local keyboard injection bridge (Wayland)
+Documentation=file://@BIN_DIR@/opencode-voice-typer
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BIN_DIR@/opencode-voice-typer --port 4096
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

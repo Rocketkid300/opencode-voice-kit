@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Launch OpenCode with local voice input.
+#
+# Voice runs in a hidden tmux session, so there is no separate Voice Input
+# window.  Hold Right Alt, speak, release: the transcript is typed into the
+# prompt and submitted.
+#
+# If an OpenCode TUI window already exists and you are on Hyprland, focus it;
+# otherwise start OpenCode in the current terminal.  The desktop entry uses
+# Terminal=true so this works without hard-coding a terminal emulator.
+set -euo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+HELPER="${OPENCODE_VOICE_HELPER:-$SCRIPT_DIR/opencode-voice-helper}"
+
+if [ -x "$HELPER" ]; then
+  "$HELPER" ensure-hidden >/dev/null 2>&1 || true
+fi
+
+# Re-focus an existing OpenCode TUI instead of opening a duplicate.
+if command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+  existing=$(
+    hyprctl clients -j 2>/dev/null |
+      jq -r '.[] | select(.title | startswith("OC |")) | .address' 2>/dev/null |
+      head -n 1
+  )
+
+  if [ -n "${existing:-}" ] && [ "$existing" != "null" ]; then
+    hyprctl dispatch "hl.dsp.focus({ window = \"address:$existing\" })" \
+      >/dev/null 2>&1 ||
+      hyprctl dispatch focuswindow "address:$existing" >/dev/null 2>&1 ||
+      true
+    exit 0
+  fi
+fi
+
+exec opencode

@@ -1,0 +1,45 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils
+
+      - name: Shell syntax
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n bin/ocvoice
+          bash -n bin/opencode-voice-helper
+          bash -n bin/opencode-with-voice
+          bash -n tests/bridge-smoke.sh
+          bash -n tests/install-smoke.sh
+
+      - name: Python syntax
+        run: python3 -m py_compile bin/opencode-voice-typer
+
+      - name: Desktop entries
+        run: |
+          for file in desktop/*.in; do
+            name=$(basename "${file%.in}")
+            sed 's|@BIN_DIR@|/usr/local/bin|g' "$file" > "/tmp/$name"
+            desktop-file-validate "/tmp/$name"
+          done
+
+      - name: Bridge smoke test
+        run: bash tests/bridge-smoke.sh
+
+      - name: Installer smoke test
+        run: bash tests/install-smoke.sh

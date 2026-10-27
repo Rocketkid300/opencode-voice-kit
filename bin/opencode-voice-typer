@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Local HTTP bridge for opencode-voice -> focused window text injection.
+
+OpenCode V2 removed the old /tui/append-prompt and /tui/submit-prompt
+endpoints that opencode-voice 0.1.4 talks to.  This bridge implements just
+enough of that API to translate a transcript into synthetic keystrokes using
+`wtype` (Wayland virtual keyboard), so the text lands in whatever window has
+focus -- normally the OpenCode TUI prompt.
+
+Endpoints:
+  GET  /                       health (used by opencode-voice)
+  GET  /event                  SSE keep-alive (unused when prompts disabled)
+  POST /tui/append-prompt      type {"text": "..."} into the focused window
+  POST /tui/submit-prompt      press Return
+
+The optional focus step uses Hyprland's hyprctl.  On other compositors the
+bridge simply types into the currently focused window.  Run with --no-focus
+(or OPENCODE_VOICE_NO_FOCUS=1) to disable the focus attempt everywhere.
+"""
+
+import argparse
+import glob
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+LOG_PATH = os.environ.get("OPENCODE_VOICE_LOG") or os.path.join(
+    STATE_HOME, "opencode-voice-typer.log"
+)
+_log_lock = threading.Lock()
+_inject_lock = threading.Lock()
+
+
+def log(msg):
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n"
+    with _log_lock:
+        try:
+            os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+            with open(LOG_PATH, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError:
+            pass
+
+
+def wayland_display():
+    """Return a usable Wayland display name, tolerating wayland-0 vs wayland-1."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    current = os.environ.get("WAYLAND_DISPLAY")
+    if current and os.path.exists(os.path.join(runtime, current)):
+        return current
+    sockets = sorted(glob.glob(os.path.join(runtime, "wayland-*")))
+    if sockets:
+        return os.path.basename(sockets[0])
+    return current or "wayland-1"
+
+
+def run_wtype(args, timeout=15):
+    env = dict(os.environ)
+    env["XDG_RUNTIME_DIR"] = env.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    env["WAYLAND_DISPLAY"] = wayland_display()
+    return subprocess.run(
+        ["wtype", *args],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+
+
+def active_window():
+    """Best-effort Hyprland active-window info (full dict) for diagnostics."""
+    try:
+        out = subprocess.run(
+            ["hyprctl", "activewindow", "-j"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            text=True,
+        )
+        info = json.loads(out.stdout or "{}")
+        return info if isinstance(info, dict) and info.get("address") else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def opencode_window():
+    """Find the most recently used OpenCode TUI window."""
+    try:
+        out = subprocess.run(
+            ["hyprctl", "clients", "-j"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            text=True,
+        )
+        clients = json.loads(out.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+    candidates = []
+    for client in clients:
+        title = client.get("title") or ""
+        # OpenCode TUI windows are titled "OC | <session>".  Do not match
+        # arbitrary browser tabs mentioning "opencode" -- typing there would
+        # send the transcript to the wrong window.
+        if title.startswith("OC |"):
+            candidates.append(client)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c.get("focusHistoryID", 9999))
+    return candidates[0]
+
+
+def focus_opencode():
+    """Bring the OpenCode window forward. Returns its info, or None."""
+    window = opencode_window()
+    if not window:
+        return None
+    addr = window.get("address")
+    if not addr:
+        return None
+
+    current = active_window()
+    if current and current.get("address") == addr:
+        return window
+
+    commands = (
+        # This system's Hyprland uses the Lua dispatcher.
+        ["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{addr}" }})'],
+        # Fallback for standard Hyprland.
+        ["hyprctl", "dispatch", "focuswindow", f"address:{addr}"],
+    )
+    for cmd in commands:
+        try:
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        time.sleep(0.15)
+        current = active_window()
+        if current and current.get("address") == addr:
+            return window
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "opencode-voice-typer/1.0"
+
+    def log_message(self, fmt, *args):
+        log(f"{self.address_string()} {fmt % args}")
+
+    def _send(self, code=200, body=None, ctype="application/json"):
+        if body is None:
+            body = {"ok": code < 400}
+        raw = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(raw or b"{}")
+            return data if isinstance(data, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/event":
+            # Keep the SSE client alive without emitting any events.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            try:
+                while True:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    time.sleep(15)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+            return
+        self._send(200, {"ok": True, "service": "opencode-voice-typer"})
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        data = self._read_json()
+
+        if path.startswith("/tui/append-prompt"):
+            text = data.get("text")
+            if not isinstance(text, str) or not text:
+                log("append-prompt: empty text")
+                self._send(200)
+                return
+            if self.server.dry_run:
+                log(f"append-prompt (dry-run): {text!r}")
+                self._send(200)
+                return
+            # Serialize injections so concurrent dictations cannot interleave
+            # characters or race the submit keystroke.
+            with _inject_lock:
+                if not getattr(self.server, "no_focus", False):
+                    focus_opencode()
+                target = active_window()
+                if target:
+                    log(f"typing into: {target.get('class')} / {target.get('title')}")
+                try:
+                    result = run_wtype(["--", text])
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    log(f"append-prompt: wtype failed to start: {exc}")
+                    self._send(500, {"error": str(exc)})
+                    return
+                if result.returncode != 0:
+                    err = result.stderr.decode(errors="replace").strip()
+                    log(f"append-prompt: wtype exit {result.returncode}: {err}")
+                    self._send(500, {"error": err or "wtype failed"})
+                    return
+                log(f"typed: {text!r}")
+            self._send(200)
+            return
+
+        if path.startswith("/tui/submit-prompt"):
+            if self.server.dry_run:
+                log("submit-prompt (dry-run)")
+                self._send(200)
+                return
+            time.sleep(0.2)  # let the TUI consume the typed text first
+            with _inject_lock:
+                if not getattr(self.server, "no_focus", False):
+                    focus_opencode()
+                try:
+                    result = run_wtype(["-k", "Return"])
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    log(f"submit-prompt: wtype failed to start: {exc}")
+                    self._send(500, {"error": str(exc)})
+                    return
+                if result.returncode != 0:
+                    err = result.stderr.decode(errors="replace").strip()
+                    log(f"submit-prompt: wtype exit {result.returncode}: {err}")
+                    self._send(500, {"error": err or "wtype failed"})
+                    return
+                log("submitted (Return)")
+            self._send(200)
+            return
+
+        # Keep the client happy for anything else (e.g. permission replies).
+        self._send(200)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=4096)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="log requests instead of injecting keys")
+    parser.add_argument("--no-focus", action="store_true",
+                        help="do not try to focus the OpenCode window (Hyprland only)")
+    args = parser.parse_args()
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server.daemon_threads = True
+    server.dry_run = args.dry_run
+    server.no_focus = args.no_focus or os.environ.get("OPENCODE_VOICE_NO_FOCUS") == "1"
+    log(
+        f"listening on {args.host}:{args.port} "
+        f"(dry_run={args.dry_run}, no_focus={server.no_focus})"
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=OpenCode (with voice)
+Comment=OpenCode with local push-to-talk dictation — hold Right Alt
+Exec=@BIN_DIR@/opencode-with-voice
+Icon=audio-input-microphone
+Terminal=true
+Categories=Development;
+Keywords=opencode;voice;dictation;whisper;speech;stt;microphone;
+StartupNotify=false
