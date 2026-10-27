@@ -3,7 +3,8 @@
 #
 # The helper normally runs in a detached tmux session so there is no extra
 # terminal window: hold Right Alt in OpenCode, speak, release, and the
-# transcript is typed into the active OpenCode prompt by the bridge.
+# transcript is delivered to the OpenCode chat that was active when recording
+# started. Standalone use falls back to typing into the focused window.
 #
 # Commands:
 #   ensure          Start hidden if no voice helper is running

@@ -46,6 +46,7 @@ if [ "$PURGE" -eq 1 ]; then
     cargo uninstall opencode-voice >/dev/null 2>&1 || true
   fi
   rm -rf "$DATA_HOME/opencode-voice"
+  rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/opencode-voice"
   rm -f "${XDG_STATE_HOME:-$HOME/.local/state}/opencode-voice-typer.log"
 fi
 

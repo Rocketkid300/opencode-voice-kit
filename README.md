@@ -5,9 +5,11 @@
 [![platform: Linux + Wayland](https://img.shields.io/badge/platform-Linux%20%2B%20Wayland-2ea44f.svg)](#requirements)
 
 Push-to-talk dictation for the OpenCode TUI. Hold **Right Alt**, speak,
-release. The transcript is typed into the prompt and submitted. Everything
-runs locally: whisper.cpp for speech recognition, `wtype` for keyboard
-injection, and a tiny localhost bridge. No API keys, no cloud.
+release. The transcript is delivered to the OpenCode chat that was active
+when you started recording and submitted there. Switch tabs or apps while
+speaking and it still lands in the right conversation. Everything runs
+locally: whisper.cpp for speech recognition, a tiny localhost bridge, and
+OpenCode's own local API. No API keys, no cloud.
 
 The voice process runs in a hidden `tmux` session, so there is no extra
 window. The TUI plugin starts it automatically and shows live state in the
@@ -17,7 +19,7 @@ prompt footer. Tested on Arch Linux + Hyprland with OpenCode 2.1.4.
 Hold Right Alt   ● voice REC 2.4s ▰▰▰▱▱
 Release          ● voice ⠸ transcribing ▱▰▱▱▱
 Done             ● voice → sending
-Prompt           refactor the parser and add tests   ⏎ submitted
+Chat             refactor the parser and add tests   ⏎ submitted in that chat
 ```
 
 | Footer | Meaning |
@@ -26,17 +28,19 @@ Prompt           refactor the parser and add tests   ⏎ submitted
 | `● voice` | Ready — hold Right Alt |
 | `● voice REC 2.4s ▰▰▱▱▱` | Recording; the bar follows your mic level |
 | `● voice ⠸ transcribing ▱▰▱▱▱` | Whisper is working |
-| `● voice → sending` | Typing into OpenCode |
+| `● voice → sending` | Delivering to the chat where recording started |
 | `● voice ! error` | Something failed; it recovers automatically |
 
 ## Requirements
 
-- **Linux + Wayland** with virtual-keyboard support (`zwp_virtual_keyboard_v1`).
-  Hyprland and Sway work. KDE Plasma generally works. **GNOME does not**
-  support `wtype`; this kit will not type for you there.
-- **OpenCode v2**.
+- **Linux + Wayland** with virtual-keyboard support (`zwp_virtual_keyboard_v1`)
+  for the `wtype` fallback. Routed dictation into an OpenCode chat uses
+  OpenCode's local API instead. Hyprland and Sway work. KDE Plasma generally
+  works. GNOME supports routed dictation but not the `wtype` fallback.
+- **OpenCode v2** with the `opencode` CLI on `PATH` (the bridge uses
+  `opencode api` to reach the target chat).
 - `tmux`, `python3`, `curl`, `wtype`, and `jq` (only the optional launcher
-  needs `jq`).
+  needs `jq`). `wtype` is used only when no OpenCode chat target exists.
 - Rust toolchain (`cargo`), `clang`, `cmake`, `pkg-config`, and ALSA headers
   to build whisper.cpp.
 - Your user in the **`input` group**, so the global hotkey can read
@@ -130,7 +134,8 @@ OPENCODE_VOICE_MODEL=small.en ~/.local/bin/opencode-voice-helper restart
 2. Open a session. The footer should show `● voice`.
 3. Hold **Right Alt**, speak normally, release.
 4. The footer turns red and shows the recording time and mic level. After
-   release it shows `transcribing`, then the text is typed and submitted.
+   release it shows `transcribing`, then the transcript is delivered to the
+   chat where you started and submitted there.
 
 In OpenCode:
 
@@ -153,6 +158,37 @@ The **OpenCode (with voice)** desktop entry starts voice and focuses an
 existing TUI (on Hyprland) or opens OpenCode in a terminal. The secondary
 **Voice Input (dictation only)** entry attaches to the hidden voice session.
 
+## Chat routing
+
+The TUI plugin records the active session when recording starts. The bridge
+delivers the transcript to that session through `opencode api`, so switching
+tabs or apps while you speak cannot send it to the wrong chat.
+
+- **Switch tabs while speaking** — the transcript still goes to the tab where
+  you started holding Right Alt.
+- **Switch to another app** — the transcript is delivered in the background;
+  OpenCode does not need to stay focused.
+- **Target session unavailable** — voice reports an error in the helper and
+  does not fall back to typing, because that could submit another chat.
+- **No fresh target** — standalone `ocvoice`, the OpenCode home screen, or a
+  non-OpenCode app uses the original `wtype` fallback and types into the
+  focused window.
+
+The plugin writes a short-lived target in
+`~/.local/state/opencode-voice/target.json` and a diagnostic heartbeat in
+`active.json`. Both contain the session ID, title, and project directory —
+never audio. The target expires automatically: it stays fresh while recording
+and for 30 seconds after the recording ends (or two minutes if the plugin
+stops refreshing it).
+
+Overrides:
+
+```bash
+OPENCODE_VOICE_STATE_DIR=~/.local/state/opencode-voice
+OPENCODE_VOICE_TARGET_FILE=~/.local/state/opencode-voice/target.json
+OPENCODE_VOICE_TARGET_TTL=120   # seconds
+```
+
 ## How it works
 
 ```text
@@ -165,17 +201,23 @@ opencode-voice  ── whisper.cpp (local model)
       ▼
 opencode-voice-typer  (127.0.0.1:4096)
       │
-      │  wtype
-      ▼
-OpenCode TUI prompt  ── Enter ──▶ submitted
+      ├─ fresh target? ──▶ opencode api ──▶ the chat where REC started
+      │
+      └─ no target ──────▶ wtype ──▶ focused window ── Enter
 ```
 
+The TUI plugin writes the active session to `target.json` when it sees the
+helper start recording. The bridge reads that file when the transcript
+arrives and submits it to the exact session with
+`opencode api POST /api/session/<id>/prompt`. It then acknowledges the
+helper's follow-up submit request without pressing Return, so a different tab
+cannot be submitted by accident.
+
 OpenCode v2 removed the old prompt endpoints that `opencode-voice` 0.1.4
-uses, so the local bridge translates those calls into `wtype` keystrokes. It
-focuses an `OC |` window on Hyprland before typing; on other compositors it
-types into the currently focused window, so keep OpenCode focused when you
-release Right Alt. Set `OPENCODE_VOICE_NO_FOCUS=1` to disable the focus
-attempt.
+uses, so the bridge translates those calls into either the local API or
+`wtype` keystrokes. The `wtype` path focuses an `OC |` window on Hyprland
+before typing; on other compositors it types into the currently focused
+window. Set `OPENCODE_VOICE_NO_FOCUS=1` to disable the focus attempt.
 
 ## Repository layout
 
@@ -211,10 +253,33 @@ install.sh / uninstall.sh   installation helpers
 **“Recording too short”** means Right Alt was released too quickly. Hold it
 for the whole phrase (at least half a second).
 
-**Text is not typed.**
+**Text is not delivered.**
 - Check the bridge log: `tail -f ~/.local/state/opencode-voice-typer.log`.
-- On non-Hyprland compositors, keep OpenCode focused when you release.
-- Confirm `wtype` works in your compositor. GNOME is not supported.
+- If the log says `target: ses_...` and then `delivery ... failed`, OpenCode
+  could not reach that session. Check `opencode service status` and that the
+  `opencode` CLI is on the bridge's `PATH`.
+- If the log says `typing into`, the bridge used the fallback. On
+  non-Hyprland compositors, keep OpenCode focused when you release.
+- Confirm `wtype` works in your compositor for the fallback. Routed delivery
+  does not use it.
+
+**The transcript went to the wrong chat.**
+- Run `/reload` so the current TUI plugin is loaded. Older plugins only type
+  into the focused prompt.
+- Check the target the bridge saw:
+  `cat ~/.local/state/opencode-voice/target.json`.
+- Check the active-tab heartbeat:
+  `cat ~/.local/state/opencode-voice/active.json`.
+- In the log, routed delivery looks like `target: ses_...` and
+  `delivered to ses_...`; the fallback looks like `typing into: ...`.
+- If two OpenCode TUIs are open, the one that was focused when recording
+  started claims the dictation.
+
+**The helper shows `delivery ... failed` but the right chat exists.**
+- The bridge uses `opencode api`, which connects to OpenCode's background
+  service. Run `opencode service status` and make sure the CLI is available
+  outside your interactive shell.
+- The session may have been deleted between recording and delivery.
 
 **Port 4096 is already in use.**
 - Start the wrapper with `OPENCODE_VOICE_PORT=4097 ocvoice` (and use the
@@ -246,6 +311,7 @@ rm -f ~/.config/systemd/user/opencode-voice-typer.service
 rm -rf ~/.config/opencode/plugins/voice
 rm -f ~/.local/bin/{opencode-voice-helper,opencode-voice-typer,ocvoice,opencode-with-voice}
 rm -f ~/.local/share/applications/{opencode-voice.desktop,voice-input.desktop}
+rm -rf ~/.local/state/opencode-voice   # optional, removes routing state
 cargo uninstall opencode-voice            # optional
 rm -rf ~/.local/share/opencode-voice      # optional, removes the model
 ```
@@ -254,6 +320,8 @@ rm -rf ~/.local/share/opencode-voice      # optional, removes the model
 
 - Audio is captured locally and transcribed by a local whisper model.
 - The bridge listens only on `127.0.0.1:4096`.
+- Routing state stays on disk under `~/.local/state/opencode-voice`; it
+  contains session IDs, titles, and project directories, never audio.
 - Nothing is uploaded. The only network access is the one-time model
   download from Hugging Face during installation.
 - The bridge intentionally trusts local processes. Do not expose its port,
@@ -269,7 +337,8 @@ If the friend uses Windows, macOS, or GNOME, this particular kit will not
 work as-is:
 - macOS has native hotkey support in the crate, but the bridge would need a
   different text-injection method.
-- GNOME does not support `wtype`'s virtual keyboard protocol.
+- GNOME supports routed dictation but not `wtype`'s virtual keyboard
+  protocol, so the standalone fallback is unavailable.
 - Windows would need a different hotkey/injection layer.
 
 ## Credits

@@ -23,6 +23,7 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 APPLICATIONS_DIR="$DATA_HOME/applications"
 SYSTEMD_DIR="$CONFIG_HOME/systemd/user"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+VOICE_STATE_DIR="${OPENCODE_VOICE_STATE_DIR:-$STATE_DIR/opencode-voice}"
 VOICE_VERSION="${OPENCODE_VOICE_VERSION:-0.1.4}"
 MODEL="${OPENCODE_VOICE_MODEL:-base.en}"
 
@@ -48,6 +49,7 @@ Environment:
   OPENCODE_VOICE_BIN_DIR   install directory (default: ~/.local/bin)
   OPENCODE_VOICE_MODEL     whisper model (default: base.en)
   OPENCODE_VOICE_VERSION   crate version (default: 0.1.4)
+  OPENCODE_VOICE_STATE_DIR routing state directory
 EOF
 }
 
@@ -141,6 +143,7 @@ fi
 
 say "Installing scripts into $BIN_DIR"
 install -d "$BIN_DIR" "$PLUGIN_DIR" "$STATE_DIR"
+install -d -m 0700 "$VOICE_STATE_DIR"
 install -m 0755 "$ROOT/bin/opencode-voice-typer" "$BIN_DIR/"
 install -m 0755 "$ROOT/bin/ocvoice" "$BIN_DIR/"
 install -m 0755 "$ROOT/bin/opencode-voice-helper" "$BIN_DIR/"

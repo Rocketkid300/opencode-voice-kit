@@ -2,8 +2,9 @@
 # Voice input for OpenCode on Wayland.
 #
 # Starts the local HTTP bridge (opencode-voice-typer) if needed, then runs
-# opencode-voice.  Transcripts are typed into the OpenCode prompt (or the
-# focused window) using wtype.
+# opencode-voice.  Transcripts are delivered to the OpenCode chat that was
+# active when recording started.  Standalone use falls back to typing into the
+# focused window with wtype.
 #
 # Environment:
 #   OPENCODE_VOICE_PORT      bridge port (default: 4096)
@@ -11,6 +12,9 @@
 #   OPENCODE_VOICE_MODEL     whisper model, e.g. base.en or small.en
 #   OPENCODE_VOICE_NO_FOCUS  set to 1 to skip Hyprland window focusing
 #   OPENCODE_VOICE_SESSION   hidden tmux session name (default: opencode-voice)
+#   OPENCODE_VOICE_STATE_DIR state directory (default: ~/.local/state/opencode-voice)
+#   OPENCODE_VOICE_TARGET_FILE  target-session file override
+#   OPENCODE_VOICE_TARGET_TTL   target freshness in seconds (default: 120)
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -20,6 +24,10 @@ VOICE_BIN="${OPENCODE_VOICE_BIN:-$(command -v opencode-voice 2>/dev/null || true
 [ -n "$VOICE_BIN" ] || VOICE_BIN="$HOME/.cargo/bin/opencode-voice"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
 LOG="$STATE_DIR/opencode-voice-typer.log"
+VOICE_STATE_DIR="${OPENCODE_VOICE_STATE_DIR:-$STATE_DIR/opencode-voice}"
+export OPENCODE_VOICE_STATE_DIR="$VOICE_STATE_DIR"
+export OPENCODE_VOICE_TARGET_FILE="${OPENCODE_VOICE_TARGET_FILE:-$VOICE_STATE_DIR/target.json}"
+mkdir -p "$VOICE_STATE_DIR"
 
 if [ ! -x "$VOICE_BIN" ]; then
   echo "error: opencode-voice not found at $VOICE_BIN" >&2
@@ -92,12 +100,12 @@ fi
 cat <<EOF
 
 Voice input is ready.
-  Hold Right Alt, speak, release  -> transcript goes to the OpenCode prompt
+  Hold Right Alt, speak, release  -> the OpenCode chat where you started
 EOF
 if [ "${OPENCODE_VOICE_NO_FOCUS:-0}" = "1" ]; then
-  echo "  Keep OpenCode focused when you release Right Alt"
+  echo "  Standalone use types into the focused window"
 else
-  echo "  OpenCode is focused automatically when the compositor supports it"
+  echo "  With no active chat, text is typed into the focused window"
 fi
 echo
 if [ -t 0 ]; then

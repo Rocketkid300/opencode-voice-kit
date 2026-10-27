@@ -1,37 +1,60 @@
 #!/usr/bin/env python3
-"""Local HTTP bridge for opencode-voice -> focused window text injection.
+"""Local HTTP bridge for opencode-voice -> the intended OpenCode chat.
 
-OpenCode V2 removed the old /tui/append-prompt and /tui/submit-prompt
+OpenCode v2 removed the old /tui/append-prompt and /tui/submit-prompt
 endpoints that opencode-voice 0.1.4 talks to.  This bridge implements just
-enough of that API to translate a transcript into synthetic keystrokes using
-`wtype` (Wayland virtual keyboard), so the text lands in whatever window has
-focus -- normally the OpenCode TUI prompt.
+enough of that API to deliver a transcript to the session that was active
+when recording started.
+
+The TUI plugin writes <state>/opencode-voice/target.json when a recording
+begins.  When that target is fresh the bridge submits the transcript with
+`opencode api POST /api/session/<id>/prompt`, so the text lands in the right
+chat even if the user switched tabs (or apps) meanwhile.  The following
+/tui/submit-prompt call is then acknowledged without pressing Return, which
+would submit whatever happens to be focused.
+
+When no fresh target exists (standalone ocvoice, a TUI on the home screen,
+or an app that is not OpenCode), the bridge falls back to typing into the
+focused window with wtype.  If a target exists but delivery fails, it does
+not fall back: typing the transcript into another chat would be worse than
+reporting the error.
 
 Endpoints:
   GET  /                       health (used by opencode-voice)
   GET  /event                  SSE keep-alive (unused when prompts disabled)
-  POST /tui/append-prompt      type {"text": "..."} into the focused window
-  POST /tui/submit-prompt      press Return
-
-The optional focus step uses Hyprland's hyprctl.  On other compositors the
-bridge simply types into the currently focused window.  Run with --no-focus
-(or OPENCODE_VOICE_NO_FOCUS=1) to disable the focus attempt everywhere.
+  POST /tui/append-prompt      deliver {"text": "..."} to the target session
+  POST /tui/submit-prompt      press Return only after a wtype fallback
 """
 
 import argparse
 import glob
 import json
 import os
+import re
+import shutil
 import subprocess
-import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STATE_HOME = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+STATE_DIR = os.environ.get("OPENCODE_VOICE_STATE_DIR") or os.path.join(
+    STATE_HOME, "opencode-voice"
+)
+TARGET_PATH = os.environ.get("OPENCODE_VOICE_TARGET_FILE") or os.path.join(
+    STATE_DIR, "target.json"
+)
+try:
+    TARGET_TTL = float(os.environ.get("OPENCODE_VOICE_TARGET_TTL") or 120)
+except ValueError:
+    TARGET_TTL = 120.0
+if TARGET_TTL <= 0:
+    TARGET_TTL = 120.0
 LOG_PATH = os.environ.get("OPENCODE_VOICE_LOG") or os.path.join(
     STATE_HOME, "opencode-voice-typer.log"
 )
+SESSION_RE = re.compile(r"^ses_[A-Za-z0-9]+$")
+SUBMIT_WINDOW = 20.0
 _log_lock = threading.Lock()
 _inject_lock = threading.Lock()
 
@@ -45,6 +68,102 @@ def log(msg):
                 fh.write(line)
         except OSError:
             pass
+
+
+def read_target():
+    """Return a fresh target written by the TUI plugin, or None."""
+    try:
+        with open(TARGET_PATH, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != 1:
+        return None
+
+    session_id = data.get("sessionID")
+    if not isinstance(session_id, str) or not SESSION_RE.match(session_id):
+        return None
+
+    now_ms = time.time() * 1000
+    updated = data.get("updatedAt")
+    expires = data.get("expiresAt")
+    if not isinstance(updated, (int, float)) or not isinstance(expires, (int, float)):
+        return None
+    if updated > now_ms + 5000 or expires <= now_ms:
+        return None
+    # A malformed or clock-skewed file must not stay authoritative forever.
+    if now_ms - updated > TARGET_TTL * 1000:
+        return None
+
+    directory = data.get("directory")
+    if not isinstance(directory, str) or not os.path.isdir(directory):
+        directory = None
+
+    title = data.get("title")
+    if not isinstance(title, str):
+        title = None
+
+    return {
+        "sessionID": session_id,
+        "title": title,
+        "directory": directory,
+        "updatedAt": updated,
+        "expiresAt": expires,
+    }
+
+
+def opencode_bin():
+    candidates = [
+        os.environ.get("OPENCODE_VOICE_OPENCODE"),
+        shutil.which("opencode"),
+        os.path.expanduser("~/.local/bin/opencode"),
+        "/usr/bin/opencode",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def deliver_api(target, text):
+    """Submit text to one session through the OpenCode CLI.
+
+    Returns (ok, detail).  The CLI is used instead of raw HTTP because the
+    local API requires authentication; the CLI already holds the credentials.
+    """
+    binary = opencode_bin()
+    if not binary:
+        return False, "opencode CLI not found (set OPENCODE_VOICE_OPENCODE)"
+
+    command = [
+        binary,
+        "api",
+        "POST",
+        f"/api/session/{target['sessionID']}/prompt",
+        "-d",
+        json.dumps({"text": text}, ensure_ascii=False),
+    ]
+    cwd = target.get("directory") or None
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=15,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "opencode api timed out"
+    except (OSError, ValueError) as exc:
+        return False, f"opencode api failed to start: {exc}"
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return False, detail or f"opencode api exited {result.returncode}"
+    if not (result.stdout or "").strip():
+        return False, "opencode api returned no response"
+    return True, None
 
 
 def wayland_display():
@@ -153,7 +272,7 @@ def focus_opencode():
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "opencode-voice-typer/1.0"
+    server_version = "opencode-voice-typer/1.1"
 
     def log_message(self, fmt, *args):
         log(f"{self.address_string()} {fmt % args}")
@@ -179,6 +298,122 @@ class Handler(BaseHTTPRequestHandler):
             return data if isinstance(data, dict) else {}
         except (ValueError, TypeError):
             return {}
+
+    def _route(self, kind):
+        self.server.last_delivery = kind
+        self.server.last_delivery_at = time.monotonic()
+
+    def _append(self, text):
+        target = read_target()
+        if target:
+            label = target["title"] or target["sessionID"]
+            log(f"target: {target['sessionID']} ({label})")
+            if self.server.dry_run:
+                log(f"append-prompt (dry-run, routed to {target['sessionID']}): {text!r}")
+                self._route("api")
+                self._send(200, {"ok": True, "routed": True, "dryRun": True})
+                return
+
+            ok, error = deliver_api(target, text)
+            if ok:
+                log(f"delivered to {target['sessionID']}: {text!r}")
+                self._route("api")
+                self._send(200, {"ok": True, "routed": True, "sessionID": target["sessionID"]})
+            else:
+                # Do not fall through to wtype.  The correct chat is known but
+                # unreachable; typing into the focused window could submit the
+                # transcript to a different conversation.
+                log(f"delivery to {target['sessionID']} failed: {error}")
+                self._route("api-failed")
+                self._send(
+                    500,
+                    {"error": error, "sessionID": target["sessionID"]},
+                )
+            return
+
+        if self.server.dry_run:
+            log(f"append-prompt (dry-run): {text!r}")
+            self._route("wtype")
+            self._send(200)
+            return
+
+        # No target: preserve standalone/ocvoice behavior and type into the
+        # focused window.
+        if not getattr(self.server, "no_focus", False):
+            focus_opencode()
+        window = active_window()
+        if window:
+            log(f"typing into: {window.get('class')} / {window.get('title')}")
+        try:
+            result = run_wtype(["--", text])
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            log(f"append-prompt: wtype failed to start: {exc}")
+            self._route("wtype-failed")
+            self._send(500, {"error": str(exc)})
+            return
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace").strip()
+            log(f"append-prompt: wtype exit {result.returncode}: {err}")
+            self._route("wtype-failed")
+            self._send(500, {"error": err or "wtype failed"})
+            return
+        log(f"typed: {text!r}")
+        self._route("wtype")
+        self._send(200)
+
+    def _submit(self):
+        kind = self.server.last_delivery
+        age = time.monotonic() - self.server.last_delivery_at
+        if age > SUBMIT_WINDOW:
+            kind = None
+            self.server.last_delivery = None
+
+        if kind in ("api", "api-failed"):
+            self.server.last_delivery = None
+            log(f"submit suppressed after API delivery (route={kind})")
+            self._send(200)
+            return
+
+        if kind == "wtype-failed":
+            self.server.last_delivery = None
+            log("submit suppressed after failed wtype delivery")
+            self._send(200)
+            return
+
+        if kind is None:
+            # The append request was lost.  A fresh target means OpenCode was
+            # the intended destination, so do not press Return blindly.
+            target = read_target()
+            if target:
+                log(
+                    "submit suppressed (fresh target "
+                    f"{target['sessionID']} with no matching append)"
+                )
+                self._send(200)
+                return
+
+        self.server.last_delivery = None
+        if self.server.dry_run:
+            log("submit-prompt (dry-run)")
+            self._send(200)
+            return
+
+        time.sleep(0.2)  # let the TUI consume the typed text first
+        if not getattr(self.server, "no_focus", False):
+            focus_opencode()
+        try:
+            result = run_wtype(["-k", "Return"])
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            log(f"submit-prompt: wtype failed to start: {exc}")
+            self._send(500, {"error": str(exc)})
+            return
+        if result.returncode != 0:
+            err = result.stderr.decode(errors="replace").strip()
+            log(f"submit-prompt: wtype exit {result.returncode}: {err}")
+            self._send(500, {"error": err or "wtype failed"})
+            return
+        log("submitted (Return)")
+        self._send(200)
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
@@ -208,55 +443,15 @@ class Handler(BaseHTTPRequestHandler):
                 log("append-prompt: empty text")
                 self._send(200)
                 return
-            if self.server.dry_run:
-                log(f"append-prompt (dry-run): {text!r}")
-                self._send(200)
-                return
-            # Serialize injections so concurrent dictations cannot interleave
-            # characters or race the submit keystroke.
+            # Serialize deliveries so concurrent dictations cannot interleave
+            # text or race the submit decision.
             with _inject_lock:
-                if not getattr(self.server, "no_focus", False):
-                    focus_opencode()
-                target = active_window()
-                if target:
-                    log(f"typing into: {target.get('class')} / {target.get('title')}")
-                try:
-                    result = run_wtype(["--", text])
-                except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    log(f"append-prompt: wtype failed to start: {exc}")
-                    self._send(500, {"error": str(exc)})
-                    return
-                if result.returncode != 0:
-                    err = result.stderr.decode(errors="replace").strip()
-                    log(f"append-prompt: wtype exit {result.returncode}: {err}")
-                    self._send(500, {"error": err or "wtype failed"})
-                    return
-                log(f"typed: {text!r}")
-            self._send(200)
+                self._append(text)
             return
 
         if path.startswith("/tui/submit-prompt"):
-            if self.server.dry_run:
-                log("submit-prompt (dry-run)")
-                self._send(200)
-                return
-            time.sleep(0.2)  # let the TUI consume the typed text first
             with _inject_lock:
-                if not getattr(self.server, "no_focus", False):
-                    focus_opencode()
-                try:
-                    result = run_wtype(["-k", "Return"])
-                except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                    log(f"submit-prompt: wtype failed to start: {exc}")
-                    self._send(500, {"error": str(exc)})
-                    return
-                if result.returncode != 0:
-                    err = result.stderr.decode(errors="replace").strip()
-                    log(f"submit-prompt: wtype exit {result.returncode}: {err}")
-                    self._send(500, {"error": err or "wtype failed"})
-                    return
-                log("submitted (Return)")
-            self._send(200)
+                self._submit()
             return
 
         # Keep the client happy for anything else (e.g. permission replies).
@@ -277,9 +472,11 @@ def main():
     server.daemon_threads = True
     server.dry_run = args.dry_run
     server.no_focus = args.no_focus or os.environ.get("OPENCODE_VOICE_NO_FOCUS") == "1"
+    server.last_delivery = None
+    server.last_delivery_at = 0.0
     log(
         f"listening on {args.host}:{args.port} "
-        f"(dry_run={args.dry_run}, no_focus={server.no_focus})"
+        f"(dry_run={args.dry_run}, no_focus={server.no_focus}, target={TARGET_PATH})"
     )
     try:
         server.serve_forever()

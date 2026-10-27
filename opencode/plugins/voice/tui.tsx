@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process"
-import { existsSync } from "node:fs"
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
+import { homedir } from "node:os"
+import { dirname, join } from "node:path"
 import { createSignal, Show } from "solid-js"
 import { Plugin } from "@opencode/plugin/tui"
 
@@ -19,6 +21,16 @@ const HELPER =
 
 const SESSION = process.env.OPENCODE_VOICE_SESSION || "opencode-voice"
 
+const STATE_HOME =
+  process.env.XDG_STATE_HOME || join(process.env.HOME || homedir(), ".local/state")
+const STATE_DIR = process.env.OPENCODE_VOICE_STATE_DIR || join(STATE_HOME, "opencode-voice")
+const TARGET_FILE = process.env.OPENCODE_VOICE_TARGET_FILE || join(STATE_DIR, "target.json")
+const ACTIVE_FILE = process.env.OPENCODE_VOICE_ACTIVE_FILE || join(STATE_DIR, "active.json")
+const TARGET_TTL = (() => {
+  const value = Number(process.env.OPENCODE_VOICE_TARGET_TTL || 120)
+  return Number.isFinite(value) && value > 0 ? value * 1000 : 120_000
+})()
+
 type HelperResult = {
   ok: boolean
   output: string
@@ -37,6 +49,26 @@ type PaneState = {
   mode: VoiceMode
   elapsed: number
   level: number
+}
+
+type SessionTarget = {
+  sessionID: string
+  title?: string
+  directory?: string
+  startedAt: number
+}
+
+type StateRecord = {
+  version: 1
+  sessionID: string | null
+  title?: string
+  directory?: string
+  mode: VoiceMode
+  focused: boolean | null
+  pid: number
+  startedAt?: number
+  updatedAt: number
+  expiresAt: number
 }
 
 const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -116,6 +148,32 @@ function sweep(frame: number, width = 5): string {
   return Array.from({ length: width }, (_, i) => (i === index ? "▰" : "▱")).join("")
 }
 
+function isActiveMode(mode: VoiceMode): boolean {
+  return mode === "recording" || mode === "transcribing" || mode === "sending"
+}
+
+function writeState(file: string, record: StateRecord) {
+  try {
+    mkdirSync(dirname(file), { recursive: true, mode: 0o700 })
+    const temporary = `${file}.${process.pid}.tmp`
+    writeFileSync(temporary, `${JSON.stringify(record)}\n`, {
+      encoding: "utf8",
+      mode: 0o600,
+    })
+    renameSync(temporary, file)
+  } catch {
+    // Dictation must keep working even when the state directory is read-only.
+  }
+}
+
+function clearState(file: string) {
+  try {
+    unlinkSync(file)
+  } catch {
+    // Already gone.
+  }
+}
+
 export default Plugin.define({
   id: "local.voice",
   async setup(context) {
@@ -124,15 +182,153 @@ export default Plugin.define({
     const [elapsed, setElapsed] = createSignal(0)
     const [level, setLevel] = createSignal(0)
     const [tick, setTick] = createSignal(0)
+    const [focused, setFocused] = createSignal<boolean | null>(null)
 
     let stopped = false
     let pollTimer: ReturnType<typeof setTimeout> | undefined
+    let footerSessionID: string | undefined
+    let lastFocusAt = 0
+    let lastActiveKey = ""
+    let lastActiveWrite = 0
+    let lockedTarget: SessionTarget | undefined
+    let wasActive = false
+
+    function onFocus() {
+      lastFocusAt = Date.now()
+      setFocused(true)
+    }
+
+    function onBlur() {
+      setFocused(false)
+    }
+
+    try {
+      context.renderer.on("focus", onFocus)
+      context.renderer.on("blur", onBlur)
+    } catch {
+      // Older hosts without renderer focus events still route by active tab.
+    }
+
+    function currentSessionID(): string | undefined {
+      try {
+        const route = context.ui.router.current()
+        if (route.type === "session" && route.sessionID && route.sessionID !== "dummy") {
+          return route.sessionID
+        }
+      } catch {
+        // Fall through to the tab/footer sources.
+      }
+      try {
+        const active = context.ui.tabs.list().find((tab) => tab.active)
+        if (active?.sessionID) return active.sessionID
+      } catch {
+        // Tabs may be unavailable.
+      }
+      return footerSessionID
+    }
+
+    function sessionDetails(sessionID: string): { title?: string; directory?: string } {
+      try {
+        const session = context.data.session.get(sessionID)
+        return {
+          title: session?.title,
+          directory: session?.location?.directory,
+        }
+      } catch {
+        return {}
+      }
+    }
+
+    function canRoute(): boolean {
+      // Unknown focus (the terminal did not report it yet) is allowed.  Once
+      // the TUI is known to be blurred, only a recent focus may claim a
+      // dictation; this keeps a background TUI from stealing another one.
+      return focused() !== false || Date.now() - lastFocusAt < 3_000
+    }
+
+    function clearTargetIfOwned() {
+      try {
+        const data = JSON.parse(readFileSync(TARGET_FILE, "utf8")) as { pid?: number }
+        if (data?.pid === process.pid) clearState(TARGET_FILE)
+      } catch {
+        // No target, or another TUI owns it.
+      }
+    }
+
+    function writeActive(currentMode: VoiceMode) {
+      const sessionID = currentSessionID()
+      const bucket = isActiveMode(currentMode) ? "active" : currentMode
+      const key = `${sessionID || ""}|${bucket}|${String(focused())}`
+      const now = Date.now()
+      if (key === lastActiveKey && now - lastActiveWrite < 10_000) return
+      lastActiveKey = key
+      lastActiveWrite = now
+      const details = sessionID ? sessionDetails(sessionID) : {}
+      writeState(ACTIVE_FILE, {
+        version: 1,
+        sessionID: sessionID ?? null,
+        title: details.title,
+        directory: details.directory,
+        mode: currentMode,
+        focused: focused(),
+        pid: process.pid,
+        updatedAt: now,
+        expiresAt: now + 30_000,
+      })
+    }
+
+    function writeTarget(currentMode: VoiceMode, target: SessionTarget, active: boolean) {
+      const now = Date.now()
+      writeState(TARGET_FILE, {
+        version: 1,
+        sessionID: target.sessionID,
+        title: target.title,
+        directory: target.directory,
+        mode: currentMode,
+        focused: focused(),
+        pid: process.pid,
+        startedAt: target.startedAt,
+        updatedAt: now,
+        expiresAt: now + (active ? TARGET_TTL : 30_000),
+      })
+    }
+
+    function lockTarget(currentMode: VoiceMode) {
+      lockedTarget = undefined
+      if (!canRoute()) {
+        // This TUI is blurred.  Invalidate a target left by an earlier
+        // dictation here, but leave another TUI's target alone.
+        clearTargetIfOwned()
+        return
+      }
+
+      const sessionID = currentSessionID()
+      if (!sessionID) {
+        // The user is on the home screen.  A stale target must not capture a
+        // dictation that has no OpenCode destination.
+        clearState(TARGET_FILE)
+        return
+      }
+
+      const details = sessionDetails(sessionID)
+      lockedTarget = {
+        sessionID,
+        title: details.title,
+        directory: details.directory,
+        startedAt: Date.now(),
+      }
+      writeTarget(currentMode, lockedTarget, true)
+    }
 
     async function refreshHelper() {
       const result = await callHelper(["status"])
       if (stopped) return
       setHelperReady(result.ok)
-      if (!result.ok) setMode("off")
+      if (!result.ok) {
+        setMode("off")
+        clearTargetIfOwned()
+        writeActive("off")
+      }
     }
 
     async function poll() {
@@ -147,23 +343,35 @@ export default Plugin.define({
       if (stopped) return
 
       let active = false
+      let currentMode: VoiceMode = "ready"
       if (pane === null) {
         // Helper is running but not in the hidden tmux session (visible mode).
         setMode("ready")
       } else {
         const parsed = parsePane(pane)
+        currentMode = parsed.mode
         setMode(parsed.mode)
         setElapsed(parsed.elapsed)
         setLevel(parsed.level)
-        active =
-          parsed.mode === "recording" ||
-          parsed.mode === "transcribing" ||
-          parsed.mode === "sending"
+        active = isActiveMode(parsed.mode)
         if (active) setTick((value) => value + 1)
       }
 
-      // Poll quickly while the mic/whisper is active, slowly when idle.
-      pollTimer = setTimeout(poll, active ? 120 : 400)
+      writeActive(currentMode)
+
+      if (active) {
+        if (!wasActive) lockTarget(currentMode)
+        else if (lockedTarget) writeTarget(currentMode, lockedTarget, true)
+      } else if (wasActive && lockedTarget) {
+        // Keep a short grace period for the bridge's submit call, but do not
+        // keep an old target fresh for later, unrelated dictation.
+        writeTarget(currentMode, lockedTarget, false)
+      }
+      wasActive = active
+
+      // Poll quickly while the mic/whisper is active, often enough when idle
+      // to catch the start of a short recording.
+      pollTimer = setTimeout(poll, active ? 120 : 250)
     }
 
     // Integrate voice with every OpenCode TUI.  The helper is a singleton, so
@@ -171,6 +379,7 @@ export default Plugin.define({
     // Do not block TUI startup while the helper loads its whisper model.
     const current = await callHelper(["status"])
     setHelperReady(current.ok)
+    writeActive(current.ok ? "ready" : "off")
     if (!current.ok) {
       void callHelper(["ensure"]).then(refreshHelper)
     }
@@ -180,7 +389,8 @@ export default Plugin.define({
 
     const unregisterStatus = context.ui.slot({
       append: "prompt.footer.status",
-      render: () => {
+      render: (input) => {
+        footerSessionID = input.sessionID
         const color = () => {
           switch (mode()) {
             case "recording":
@@ -296,6 +506,12 @@ export default Plugin.define({
       if (pollTimer) clearTimeout(pollTimer)
       clearInterval(helperTimer)
       unregisterStatus()
+      try {
+        context.renderer.off("focus", onFocus)
+        context.renderer.off("blur", onBlur)
+      } catch {
+        // Nothing to detach.
+      }
     }
   },
 })
